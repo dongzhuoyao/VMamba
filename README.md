@@ -27,7 +27,7 @@ test if the selective scan is installed correctly:
 ```bash
 pytest kernels/selective_scan/test_selective_scan.py
 ```
-
+***install the rest of package in the requirement.txt***
 ----
 <div align="center">
 <h1>VMamba </h1>
