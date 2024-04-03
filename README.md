@@ -1,4 +1,34 @@
+### Installation (in case the one down there does not work)
+**Step 1: Clone the VMamba repository:**
+To get started, first clone the VMamba repository and navigate to the project directory:
 
+**Step 2: Environment Setup:**
+
+***Create and activate a new conda environment***
+
+```bash
+conda create -n vmamba python=3.12
+conda activate vmamba
+```
+***Install Dependencies***
+
+```bash
+conda install -c "nvidia/label/cuda-11.8.0" cuda-toolkit # crucial
+conda install pytorch torchvision  pytorch-cuda=11.8 -c pytorch -c nvidia
+pip install  torchdiffeq  matplotlib h5py timm diffusers accelerate loguru blobfile 
+pip install hydra-core wandb einops scikit-learn --upgrade
+pip install transformers==4.36.2
+pip install opencv-python causal-conv1d
+cd mamba && pip install -e .
+cd kernels/selective_scan && pip install .
+pip install pytest 
+```
+test if the selective scan is installed correctly:
+```bash
+pytest kernels/selective_scan/test_selective_scan.py
+```
+
+----
 <div align="center">
 <h1>VMamba </h1>
 <h3>VMamba: Visual State Space Model</h3>
