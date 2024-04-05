@@ -2239,9 +2239,9 @@ class VSSM(nn.Module):
         print("patch_side_len", patch_side_len)  #
         if forward_type.startswith("zigzagN"):
 
-            def get_scan_path(patch_side_len):
+            def get_scan_path(_patch_side_len):
                 if forward_type.startswith("zigzagN"):
-                    _zz_paths = zigzag_path(N=patch_side_len)
+                    _zz_paths = zigzag_path(N=_patch_side_len)
                     if forward_type.startswith("zigzagN"):
                         zigzag_num = int(forward_type.replace("zigzagN", ""))
                         zz_paths = _zz_paths[:zigzag_num]
@@ -2262,10 +2262,11 @@ class VSSM(nn.Module):
                 assert len(zz_paths) == len(
                     zz_paths_rev
                 ), f"{len(zz_paths)} != {len(zz_paths_rev)}"
+                return zz_paths, zz_paths_rev
 
             zz_paths, zz_paths_rev = [], []
             for _blockid, _depth in enumerate(depths):
-                _zz_paths, _zz_paths_rev = get_scan_path(patch_side_len)
+                _zz_paths, _zz_paths_rev = get_scan_path(patch_side_len[_blockid])
                 _zz_paths, _zz_paths_rev = _zz_paths[:_depth], _zz_paths_rev[:_depth]
                 zz_paths.extend(_zz_paths)
                 zz_paths_rev.extend(_zz_paths_rev)

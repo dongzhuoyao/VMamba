@@ -143,7 +143,7 @@ def reverse_permut_np(permutation):
 
 def zigzag_path(N):
     print("zigzag_sub_v1", N)
-    assert N % 2 == 0, "N should be even"
+    # assert N % 2 == 0, "N should be even"
 
     def zigzag_path_lr(N, start_row=0, start_col=0, dir_row=1, dir_col=1):
         path = []
@@ -331,11 +331,11 @@ def draw_pineao_curve():
 
 
 if __name__ == "__main__":
-    N = 4
-    if False:
+    N = 5
+    if True:
         print(zigzag_path(N))
         print(len(zigzag_path(N)))
-    elif True:
+    elif False:
         # hilbert_path(N=N)
         # test_hibert_fig(num_dims=2, img_size_power=3)
         draw_pineao_curve()
