@@ -28,7 +28,12 @@ try:
         CrossScan_Ab_2direction,
         CrossMerge_Ab_2direction,
     )
-    from .csms6s import SelectiveScanMamba, SelectiveScanCore, SelectiveScanOflex
+    from .csms6s import (
+        SelectiveScanMamba,
+        SelectiveScanZigMa,
+        SelectiveScanCore,
+        SelectiveScanOflex,
+    )
     from .csms6s import (
         flops_selective_scan_fn,
         flops_selective_scan_ref,
@@ -43,7 +48,12 @@ except:
         CrossScan_Ab_2direction,
         CrossMerge_Ab_2direction,
     )
-    from csms6s import SelectiveScanMamba, SelectiveScanCore, SelectiveScanOflex
+    from csms6s import (
+        SelectiveScanMamba,
+        SelectiveScanZigMa,
+        SelectiveScanCore,
+        SelectiveScanOflex,
+    )
     from csms6s import (
         flops_selective_scan_fn,
         flops_selective_scan_ref,
@@ -330,6 +340,8 @@ class SS2D(nn.Module, mamba_init):
         elif forward_type.startswith("xv"):
             self.__initxv__(**kwargs)
             return
+        elif forward_type.startswith("zigma"):
+            self.__init_zigma__(**kwargs)
         else:
             self.__initv2__(**kwargs)
             return
@@ -385,43 +397,46 @@ class SS2D(nn.Module, mamba_init):
             **factory_kwargs,
         )
 
-        # x proj ============================
-        self.x_proj = [
-            nn.Linear(d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs)
-            for _ in range(k_group)
-        ]
-        self.x_proj_weight = nn.Parameter(
-            torch.stack([t.weight for t in self.x_proj], dim=0)
-        )  # (K, N, inner)
-        del self.x_proj
+        if True:
+            # x proj ============================
+            self.x_proj = [
+                nn.Linear(
+                    d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs
+                )
+                for _ in range(k_group)
+            ]
+            self.x_proj_weight = nn.Parameter(
+                torch.stack([t.weight for t in self.x_proj], dim=0)
+            )  # (K, N, inner)
+            del self.x_proj
 
-        # dt proj ============================
-        self.dt_projs = [
-            self.dt_init(
-                dt_rank,
-                d_inner,
-                dt_scale,
-                dt_init,
-                dt_min,
-                dt_max,
-                dt_init_floor,
-                **factory_kwargs,
-            )
-            for _ in range(k_group)
-        ]
-        self.dt_projs_weight = nn.Parameter(
-            torch.stack([t.weight for t in self.dt_projs], dim=0)
-        )  # (K, inner, rank)
-        self.dt_projs_bias = nn.Parameter(
-            torch.stack([t.bias for t in self.dt_projs], dim=0)
-        )  # (K, inner)
-        del self.dt_projs
+            # dt proj ============================
+            self.dt_projs = [
+                self.dt_init(
+                    dt_rank,
+                    d_inner,
+                    dt_scale,
+                    dt_init,
+                    dt_min,
+                    dt_max,
+                    dt_init_floor,
+                    **factory_kwargs,
+                )
+                for _ in range(k_group)
+            ]
+            self.dt_projs_weight = nn.Parameter(
+                torch.stack([t.weight for t in self.dt_projs], dim=0)
+            )  # (K, inner, rank)
+            self.dt_projs_bias = nn.Parameter(
+                torch.stack([t.bias for t in self.dt_projs], dim=0)
+            )  # (K, inner)
+            del self.dt_projs
 
-        # A, D =======================================
-        self.A_logs = self.A_log_init(
-            d_state, d_inner, copies=k_group, merge=True
-        )  # (K * D, N)
-        self.Ds = self.D_init(d_inner, copies=k_group, merge=True)  # (K * D)
+            # A, D =======================================
+            self.A_logs = self.A_log_init(
+                d_state, d_inner, copies=k_group, merge=True
+            )  # (K * D, N)
+            self.Ds = self.D_init(d_inner, copies=k_group, merge=True)  # (K * D)
 
         # out proj =======================================
         self.out_norm = nn.LayerNorm(d_inner)
@@ -603,7 +618,6 @@ class SS2D(nn.Module, mamba_init):
             ),
         )
         self.forward_core = FORWARD_TYPES.get(forward_type, None)
-        k_group = 4
 
         # in proj =======================================
         d_proj = d_inner if self.disable_z else (d_inner * 2)
@@ -622,69 +636,140 @@ class SS2D(nn.Module, mamba_init):
                 **factory_kwargs,
             )
 
-        # x proj ============================
-        self.x_proj = [
-            nn.Linear(d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs)
-            for _ in range(k_group)
-        ]
-        self.x_proj_weight = nn.Parameter(
-            torch.stack([t.weight for t in self.x_proj], dim=0)
-        )  # (K, N, inner)
-        del self.x_proj
-
-        # out proj =======================================
-        self.out_act = nn.GELU() if self.oact else nn.Identity()
-        self.out_proj = Linear(d_inner, d_model, bias=bias, **factory_kwargs)
-        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-
-        if initialize in ["v0"]:
-            # dt proj ============================
-            self.dt_projs = [
-                self.dt_init(
-                    dt_rank,
-                    d_inner,
-                    dt_scale,
-                    dt_init,
-                    dt_min,
-                    dt_max,
-                    dt_init_floor,
-                    **factory_kwargs,
+        if forward_type.startswith("zigma"):
+            k_group = 1  # Important
+            # x proj ============================
+            self.x_proj = [
+                nn.Linear(
+                    d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs
                 )
                 for _ in range(k_group)
             ]
-            self.dt_projs_weight = nn.Parameter(
-                torch.stack([t.weight for t in self.dt_projs], dim=0)
-            )  # (K, inner, rank)
-            self.dt_projs_bias = nn.Parameter(
-                torch.stack([t.bias for t in self.dt_projs], dim=0)
-            )  # (K, inner)
-            del self.dt_projs
+            self.x_proj_weight = nn.Parameter(
+                torch.stack([t.weight for t in self.x_proj], dim=0)
+            )  # (K, N, inner)
+            del self.x_proj
 
-            # A, D =======================================
-            self.A_logs = self.A_log_init(
-                d_state, d_inner, copies=k_group, merge=True
-            )  # (K * D, N)
-            self.Ds = self.D_init(d_inner, copies=k_group, merge=True)  # (K * D)
-        elif initialize in ["v1"]:
-            # simple init dt_projs, A_logs, Ds
-            self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
-            self.A_logs = nn.Parameter(
-                torch.randn((k_group * d_inner, d_state))
-            )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
-            self.dt_projs_weight = nn.Parameter(
-                torch.randn((k_group, d_inner, dt_rank))
-            )
-            self.dt_projs_bias = nn.Parameter(torch.randn((k_group, d_inner)))
-        elif initialize in ["v2"]:
-            # simple init dt_projs, A_logs, Ds
-            self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
-            self.A_logs = nn.Parameter(
-                torch.zeros((k_group * d_inner, d_state))
-            )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
-            self.dt_projs_weight = nn.Parameter(
-                0.1 * torch.rand((k_group, d_inner, dt_rank))
-            )
-            self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((k_group, d_inner)))
+            # out proj =======================================
+            self.out_act = nn.GELU() if self.oact else nn.Identity()
+            self.out_proj = Linear(d_inner, d_model, bias=bias, **factory_kwargs)
+            self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+            if initialize in ["v0"]:
+                # dt proj ============================
+                self.dt_projs = [
+                    self.dt_init(
+                        dt_rank,
+                        d_inner,
+                        dt_scale,
+                        dt_init,
+                        dt_min,
+                        dt_max,
+                        dt_init_floor,
+                        **factory_kwargs,
+                    )
+                    for _ in range(k_group)
+                ]
+                self.dt_projs_weight = nn.Parameter(
+                    torch.stack([t.weight for t in self.dt_projs], dim=0)
+                )  # (K, inner, rank)
+                self.dt_projs_bias = nn.Parameter(
+                    torch.stack([t.bias for t in self.dt_projs], dim=0)
+                )  # (K, inner)
+                del self.dt_projs
+
+                # A, D =======================================
+                self.A_logs = self.A_log_init(
+                    d_state, d_inner, copies=k_group, merge=True
+                )  # (K * D, N)
+                self.Ds = self.D_init(d_inner, copies=k_group, merge=True)  # (K * D)
+            elif initialize in ["v1"]:
+                # simple init dt_projs, A_logs, Ds
+                self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
+                self.A_logs = nn.Parameter(
+                    torch.randn((k_group * d_inner, d_state))
+                )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+                self.dt_projs_weight = nn.Parameter(
+                    torch.randn((k_group, d_inner, dt_rank))
+                )
+                self.dt_projs_bias = nn.Parameter(torch.randn((k_group, d_inner)))
+            elif initialize in ["v2"]:
+                # simple init dt_projs, A_logs, Ds
+                self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
+                self.A_logs = nn.Parameter(
+                    torch.zeros((k_group * d_inner, d_state))
+                )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+                self.dt_projs_weight = nn.Parameter(
+                    0.1 * torch.rand((k_group, d_inner, dt_rank))
+                )
+                self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((k_group, d_inner)))
+        else:
+            k_group = 4  # Important
+            # x proj ============================
+            self.x_proj = [
+                nn.Linear(
+                    d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs
+                )
+                for _ in range(k_group)
+            ]
+            self.x_proj_weight = nn.Parameter(
+                torch.stack([t.weight for t in self.x_proj], dim=0)
+            )  # (K, N, inner)
+            del self.x_proj
+
+            # out proj =======================================
+            self.out_act = nn.GELU() if self.oact else nn.Identity()
+            self.out_proj = Linear(d_inner, d_model, bias=bias, **factory_kwargs)
+            self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+            if initialize in ["v0"]:
+                # dt proj ============================
+                self.dt_projs = [
+                    self.dt_init(
+                        dt_rank,
+                        d_inner,
+                        dt_scale,
+                        dt_init,
+                        dt_min,
+                        dt_max,
+                        dt_init_floor,
+                        **factory_kwargs,
+                    )
+                    for _ in range(k_group)
+                ]
+                self.dt_projs_weight = nn.Parameter(
+                    torch.stack([t.weight for t in self.dt_projs], dim=0)
+                )  # (K, inner, rank)
+                self.dt_projs_bias = nn.Parameter(
+                    torch.stack([t.bias for t in self.dt_projs], dim=0)
+                )  # (K, inner)
+                del self.dt_projs
+
+                # A, D =======================================
+                self.A_logs = self.A_log_init(
+                    d_state, d_inner, copies=k_group, merge=True
+                )  # (K * D, N)
+                self.Ds = self.D_init(d_inner, copies=k_group, merge=True)  # (K * D)
+            elif initialize in ["v1"]:
+                # simple init dt_projs, A_logs, Ds
+                self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
+                self.A_logs = nn.Parameter(
+                    torch.randn((k_group * d_inner, d_state))
+                )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+                self.dt_projs_weight = nn.Parameter(
+                    torch.randn((k_group, d_inner, dt_rank))
+                )
+                self.dt_projs_bias = nn.Parameter(torch.randn((k_group, d_inner)))
+            elif initialize in ["v2"]:
+                # simple init dt_projs, A_logs, Ds
+                self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
+                self.A_logs = nn.Parameter(
+                    torch.zeros((k_group * d_inner, d_state))
+                )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+                self.dt_projs_weight = nn.Parameter(
+                    0.1 * torch.rand((k_group, d_inner, dt_rank))
+                )
+                self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((k_group, d_inner)))
 
     def __initxv__(
         self,
@@ -1062,6 +1147,160 @@ class SS2D(nn.Module, mamba_init):
         out = self.dropout(self.out_proj(y))
         return out
 
+    def __init_zigma__(
+        self,
+        # basic dims ===========
+        d_model=96,
+        d_state=16,
+        ssm_ratio=2.0,
+        dt_rank="auto",
+        act_layer=nn.SiLU,
+        # dwconv ===============
+        d_conv=3,  # < 2 means no conv
+        conv_bias=True,
+        # ======================
+        dropout=0.0,
+        bias=False,
+        # dt init ==============
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_init="random",
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+        initialize="v0",
+        # ======================
+        forward_type="v2",
+        channel_first=False,
+        # ======================
+        **kwargs,
+    ):
+        factory_kwargs = {"device": None, "dtype": None}
+        super().__init__()
+        d_inner = int(ssm_ratio * d_model)
+        dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
+        self.d_conv = d_conv
+        self.channel_first = channel_first
+        Linear = Linear2d if channel_first else nn.Linear
+        self.forward = self.forwardv2
+
+        # tags for forward_type ==============================
+        def checkpostfix(tag, value):
+            ret = value[-len(tag) :] == tag
+            if ret:
+                value = value[: -len(tag)]
+            return ret, value
+
+        self.disable_force32, forward_type = checkpostfix("no32", forward_type)
+        self.oact, forward_type = checkpostfix("oact", forward_type)
+        self.disable_z, forward_type = checkpostfix("noz", forward_type)
+        self.disable_z_act, forward_type = checkpostfix("nozact", forward_type)
+
+        # softmax | sigmoid | dwconv | norm ===========================
+        self.out_norm_shape = "v1"
+        if forward_type[-len("none") :] == "none":
+            forward_type = forward_type[: -len("none")]
+            self.out_norm = nn.Identity()
+        elif forward_type[-len("dwconv3") :] == "dwconv3":
+            forward_type = forward_type[: -len("dwconv3")]
+            self.out_norm = nn.Conv2d(
+                d_inner, d_inner, kernel_size=3, padding=1, groups=d_inner, bias=False
+            )
+        elif forward_type[-len("softmax") :] == "softmax":
+            forward_type = forward_type[: -len("softmax")]
+
+            class SoftmaxSpatial(nn.Softmax):
+                def forward(self, x: torch.Tensor):
+                    B, C, H, W = x.shape
+                    return super().forward(x.view(B, C, -1)).view(B, C, H, W)
+
+            self.out_norm = SoftmaxSpatial(dim=-1)
+        elif forward_type[-len("sigmoid") :] == "sigmoid":
+            forward_type = forward_type[: -len("sigmoid")]
+            self.out_norm = nn.Sigmoid()
+        elif channel_first:
+            self.out_norm = LayerNorm2d(d_inner)
+        else:
+            self.out_norm_shape = "v0"
+            self.out_norm = nn.LayerNorm(d_inner)
+
+        self.forward_core = partial(
+            self.forward_corev2_zigma,
+            force_fp32=(not self.disable_force32),
+            SelectiveScan=SelectiveScanMamba,
+        )
+        k_group = 1  # only one scans
+        # in proj =======================================
+        d_proj = d_inner if self.disable_z else (d_inner * 2)
+        self.in_proj = Linear(d_model, d_proj, bias=bias, **factory_kwargs)
+        self.act: nn.Module = act_layer()
+
+        # conv =======================================
+        if d_conv > 1:
+            self.conv2d = nn.Conv2d(
+                in_channels=d_inner,
+                out_channels=d_inner,
+                groups=d_inner,
+                bias=conv_bias,
+                kernel_size=d_conv,
+                padding=(d_conv - 1) // 2,
+                **factory_kwargs,
+            )
+
+        # x proj ============================
+        self.x_proj = nn.Linear(
+            d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs
+        )
+
+        self.x_proj_weight = nn.Parameter(self.x_proj.weight)  # (N, inner)
+        del self.x_proj
+
+        # out proj =======================================
+        self.out_act = nn.GELU() if self.oact else nn.Identity()
+        self.out_proj = Linear(d_inner, d_model, bias=bias, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        if initialize in ["v0"]:
+            # dt proj ============================
+            self.dt_projs = self.dt_init(
+                dt_rank,
+                d_inner,
+                dt_scale,
+                dt_init,
+                dt_min,
+                dt_max,
+                dt_init_floor,
+                **factory_kwargs,
+            )
+            self.dt_projs_weight = nn.Parameter(self.dt_projs.weight)  # (inner, rank)
+            self.dt_projs_bias = nn.Parameter(self.dt_projs.bias)  # (inner, rank)
+            del self.dt_projs
+
+            # A, D =======================================
+            self.A_logs = self.A_log_init(
+                d_state, d_inner, copies=k_group, merge=True
+            )  # (K * D, N)
+            self.Ds = self.D_init(d_inner, copies=k_group, merge=True)  # (K * D)
+        elif initialize in ["v1"]:
+            # simple init dt_projs, A_logs, Ds
+            self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
+            self.A_logs = nn.Parameter(
+                torch.randn((k_group * d_inner, d_state))
+            )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+            self.dt_projs_weight = nn.Parameter(
+                torch.randn((k_group, d_inner, dt_rank))
+            )
+            self.dt_projs_bias = nn.Parameter(torch.randn((k_group, d_inner)))
+        elif initialize in ["v2"]:
+            # simple init dt_projs, A_logs, Ds
+            self.Ds = nn.Parameter(torch.ones((k_group * d_inner)))
+            self.A_logs = nn.Parameter(
+                torch.zeros((k_group * d_inner, d_state))
+            )  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+            self.dt_projs_weight = nn.Parameter(
+                0.1 * torch.rand((k_group, d_inner, dt_rank))
+            )
+            self.dt_projs_bias = nn.Parameter(0.1 * torch.rand((k_group, d_inner)))
+
     # cascade2d
     def forward_corev1(
         self,
@@ -1269,6 +1508,298 @@ class SS2D(nn.Module, mamba_init):
             y = out_norm(y).view(B, H, W, -1)
 
         return y.to(x.dtype) if to_dtype else y
+
+    # copied from function forward_corev2()
+    def forward_corev2_zigma_old(
+        self,
+        x: torch.Tensor = None,
+        x_proj_weight: torch.Tensor = None,
+        x_proj_bias: torch.Tensor = None,
+        dt_projs_weight: torch.Tensor = None,
+        dt_projs_bias: torch.Tensor = None,
+        A_logs: torch.Tensor = None,
+        Ds: torch.Tensor = None,
+        delta_softplus=True,
+        out_norm: torch.nn.Module = None,
+        out_norm_shape="v0",
+        channel_first=False,
+        # ==============================
+        to_dtype=True,  # True: final out to dtype
+        force_fp32=False,  # True: input fp32
+        # ==============================
+        nrows=-1,  # for SelectiveScanNRow; 0: auto; -1: disable;
+        backnrows=-1,  # for SelectiveScanNRow; 0: auto; -1: disable;
+        ssoflex=True,  # True: out fp32 in SSOflex; else, SSOflex is the same as SSCore
+        # ==============================
+        SelectiveScan=None,
+        no_einsum=False,  # replace einsum with linear or conv1d to raise throughput
+        **kwargs,
+    ):
+        x_proj_weight = self.x_proj_weight
+        dt_projs_weight = self.dt_projs_weight
+        dt_projs_bias = self.dt_projs_bias
+        A_logs = self.A_logs
+        Ds = self.Ds
+        out_norm = getattr(self, "out_norm", None)
+        out_norm_shape = getattr(self, "out_norm_shape", "v0")
+        channel_first = self.channel_first
+        to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
+
+        # out_norm: whatever fits (B, L, C); LayerNorm; Sigmoid; Softmax(dim=1);...
+
+        B, D, H, W = x.shape
+        D, N = A_logs.shape
+        D, R = dt_projs_weight.shape
+        L = H * W
+
+        def selective_scan(
+            u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True
+        ):
+
+            res = SelectiveScanCore.apply(
+                u,
+                delta,
+                A,
+                B,
+                C,
+                D,
+                delta_bias,
+                delta_softplus,
+                nrows,
+                backnrows,
+                ssoflex,
+            )
+            return res
+
+        xs = rearrange(x, "b c w h -> b c (w h)")  # xs = CrossScan.apply(x)
+        if no_einsum:
+            raise NotImplementedError("not checked by me yet")
+            x_dbl = F.conv1d(
+                xs.view(B, -1, L),
+                x_proj_weight.view(-1, D, 1),
+                bias=(x_proj_bias.view(-1) if x_proj_bias is not None else None),
+                groups=K,
+            )
+            dts, Bs, Cs = torch.split(x_dbl.view(B, K, -1, L), [R, N, N], dim=2)
+            dts = F.conv1d(
+                dts.contiguous().view(B, -1, L),
+                dt_projs_weight.view(K * D, -1, 1),
+                groups=K,
+            )
+        else:
+            x_dbl = torch.einsum("b  d l,  c d -> b  c l", xs, x_proj_weight)
+            if x_proj_bias is not None:
+                x_dbl = x_dbl + x_proj_bias.view(1, K, -1, 1)
+            dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=1)
+            dts = torch.einsum("b  r l,  d r -> b  d l", dts, dt_projs_weight)
+
+        xs = xs.view(B, -1, L)  # directly combine them together [B,C,H*W]->[B,C,H*W]
+        dts = dts.contiguous().view(B, -1, L)
+        As = -torch.exp(A_logs.to(torch.float))  # (k * c, d_state)
+        Bs = Bs.contiguous().view(B, N, L)
+        Cs = Cs.contiguous().view(B, N, L)
+        Ds = Ds.to(torch.float)  # (K * c)
+        delta_bias = dt_projs_bias.view(-1).to(torch.float)
+
+        if force_fp32:
+            xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
+
+        ys: torch.Tensor = selective_scan(
+            xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
+        ).view(B, -1, H, W)
+
+        y = ys  # y: torch.Tensor = CrossMerge.apply(ys)
+
+        if getattr(self, "__DEBUG__", False):
+            setattr(
+                self,
+                "__data__",
+                dict(
+                    A_logs=A_logs,
+                    Bs=Bs,
+                    Cs=Cs,
+                    Ds=Ds,
+                    us=xs,
+                    dts=dts,
+                    delta_bias=delta_bias,
+                    ys=ys,
+                    y=y,
+                ),
+            )
+
+        if channel_first:
+            y = y.view(B, -1, H, W)
+            if out_norm_shape in ["v1"]:
+                y = out_norm(y)
+            else:
+                y = out_norm(y.permute(0, 2, 3, 1))
+                y = y.permute(0, 3, 1, 2)
+            return y.to(x.dtype) if to_dtype else y
+
+        if out_norm_shape in ["v1"]:  # (B, C, H, W)
+            y = out_norm(y.view(B, -1, H, W)).permute(0, 2, 3, 1)  # (B, H, W, C)
+        else:  # (B, L, C)
+            y = y.transpose(dim0=1, dim1=2).contiguous()  # (B, L, C)
+            y = out_norm(y).view(B, H, W, -1)
+
+        return y.to(x.dtype) if to_dtype else y
+
+
+    # Note: we did not use csm_triton in and before vssm1_0230, we used pytorch version !
+    # Note: we did not use no_einsum in and before vssm1_0230, we used einsum version !
+    def forward_corev2_zigma(
+        self,
+        x: torch.Tensor = None,
+        x_proj_weight: torch.Tensor = None,
+        x_proj_bias: torch.Tensor = None,
+        dt_projs_weight: torch.Tensor = None,
+        dt_projs_bias: torch.Tensor = None,
+        A_logs: torch.Tensor = None,
+        Ds: torch.Tensor = None,
+        delta_softplus=True,
+        out_norm: torch.nn.Module = None,
+        out_norm_shape="v0",
+        channel_first=False,
+        # ==============================
+        to_dtype=True,  # True: final out to dtype
+        force_fp32=False,  # True: input fp32
+        # ==============================
+        nrows=-1,  # for SelectiveScanNRow; 0: auto; -1: disable;
+        backnrows=-1,  # for SelectiveScanNRow; 0: auto; -1: disable;
+        ssoflex=True,  # True: out fp32 in SSOflex; else, SSOflex is the same as SSCore
+        # ==============================
+        SelectiveScan=None,
+        CrossScan=CrossScan,
+        CrossMerge=CrossMerge,
+        no_einsum=False,  # replace einsum with linear or conv1d to raise throughput
+        **kwargs,
+    ):
+        x_proj_weight = self.x_proj_weight
+        dt_projs_weight = self.dt_projs_weight
+        dt_projs_bias = self.dt_projs_bias
+        A_logs = self.A_logs
+        Ds = self.Ds
+        out_norm = getattr(self, "out_norm", None)
+        out_norm_shape = getattr(self, "out_norm_shape", "v0")
+        channel_first = self.channel_first
+        to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
+
+        # out_norm: whatever fits (B, L, C); LayerNorm; Sigmoid; Softmax(dim=1);...
+
+        B, D, H, W = x.shape
+        D, N = A_logs.shape
+        K, D, R = dt_projs_weight.shape
+        L = H * W
+
+        if nrows == 0:
+            if D % 4 == 0:
+                nrows = 4
+            elif D % 3 == 0:
+                nrows = 3
+            elif D % 2 == 0:
+                nrows = 2
+            else:
+                nrows = 1
+
+        if backnrows == 0:
+            if D % 4 == 0:
+                backnrows = 4
+            elif D % 3 == 0:
+                backnrows = 3
+            elif D % 2 == 0:
+                backnrows = 2
+            else:
+                backnrows = 1
+
+        def selective_scan(
+            u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True
+        ):
+            return SelectiveScan.apply(
+                u,
+                delta,
+                A,
+                B,
+                C,
+                D,
+                delta_bias,
+                delta_softplus,
+                nrows,
+                backnrows,
+                ssoflex,
+            )
+
+        xs = CrossScan.apply(x)
+        if no_einsum:
+            x_dbl = F.conv1d(
+                xs.view(B, -1, L),
+                x_proj_weight.view(-1, D, 1),
+                bias=(x_proj_bias.view(-1) if x_proj_bias is not None else None),
+                groups=K,
+            )
+            dts, Bs, Cs = torch.split(x_dbl.view(B, K, -1, L), [R, N, N], dim=2)
+            dts = F.conv1d(
+                dts.contiguous().view(B, -1, L),
+                dt_projs_weight.view(K * D, -1, 1),
+                groups=K,
+            )
+        else:
+            x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs, x_proj_weight)
+            if x_proj_bias is not None:
+                x_dbl = x_dbl + x_proj_bias.view(1, K, -1, 1)
+            dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=2)
+            dts = torch.einsum("b k r l, k d r -> b k d l", dts, dt_projs_weight)
+
+        xs = xs.view(B, -1, L)
+        dts = dts.contiguous().view(B, -1, L)
+        As = -torch.exp(A_logs.to(torch.float))  # (k * c, d_state)
+        Bs = Bs.contiguous().view(B, K, N, L)
+        Cs = Cs.contiguous().view(B, K, N, L)
+        Ds = Ds.to(torch.float)  # (K * c)
+        delta_bias = dt_projs_bias.view(-1).to(torch.float)
+
+        if force_fp32:
+            xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
+
+        ys: torch.Tensor = selective_scan(
+            xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
+        ).view(B, K, -1, H, W)
+
+        y: torch.Tensor = CrossMerge.apply(ys)
+
+        if getattr(self, "__DEBUG__", False):
+            setattr(
+                self,
+                "__data__",
+                dict(
+                    A_logs=A_logs,
+                    Bs=Bs,
+                    Cs=Cs,
+                    Ds=Ds,
+                    us=xs,
+                    dts=dts,
+                    delta_bias=delta_bias,
+                    ys=ys,
+                    y=y,
+                ),
+            )
+
+        if channel_first:
+            y = y.view(B, -1, H, W)
+            if out_norm_shape in ["v1"]:
+                y = out_norm(y)
+            else:
+                y = out_norm(y.permute(0, 2, 3, 1))
+                y = y.permute(0, 3, 1, 2)
+            return y.to(x.dtype) if to_dtype else y
+
+        if out_norm_shape in ["v1"]:  # (B, C, H, W)
+            y = out_norm(y.view(B, -1, H, W)).permute(0, 2, 3, 1)  # (B, H, W, C)
+        else:  # (B, L, C)
+            y = y.transpose(dim0=1, dim1=2).contiguous()  # (B, L, C)
+            y = out_norm(y).view(B, H, W, -1)
+
+        return y.to(x.dtype) if to_dtype else y
+    
 
     # Note: we did not use csm_triton in and before vssm1_0230, we used pytorch version !
     # Note: we did not use no_einsum in and before vssm1_0230, we used einsum version !
@@ -2213,7 +2744,13 @@ class Backbone_VSSM(VSSM):
 if __name__ == "__main__":
     import torch
 
-    _model = VSSM().to('cuda')
-    x = torch.randn((1, 3, 224, 224)).to('cuda')
-    y = _model(x)
-    print(y.shape)
+    if True:
+        _model = VSSM(forward_type="zigmaN8").to("cuda")
+        x = torch.randn((1, 3, 224, 224)).to("cuda")
+        y = _model(x)
+        print(y.shape)
+    else:
+        _model = VSSM(forward_type="v3noz").to("cuda")
+        x = torch.randn((1, 3, 224, 224)).to("cuda")
+        y = _model(x)
+        print(y.shape)
