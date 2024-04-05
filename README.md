@@ -19,7 +19,7 @@ pip install  torchdiffeq  matplotlib h5py timm diffusers accelerate loguru blobf
 pip install hydra-core wandb einops scikit-learn --upgrade
 pip install transformers==4.36.2
 pip install opencv-python causal-conv1d
-cd mamba && pip install -e .
+cd mamba && pip install -e . && cd ..
 cd kernels/selective_scan && pip install .
 pip install pytest 
 ```
