@@ -6,12 +6,22 @@ from functools import partial
 from typing import Optional, Callable, Any
 from collections import OrderedDict
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
 from timm.models.layers import DropPath, trunc_normal_
+
+try:
+    from classification.models.utils_zigzag import (
+        hilbert_path,
+        reverse_permut_np,
+        zigzag_path,
+    )
+except:
+    from utils_zigzag import hilbert_path, reverse_permut_np, zigzag_path
 
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
@@ -340,7 +350,7 @@ class SS2D(nn.Module, mamba_init):
         elif forward_type.startswith("xv"):
             self.__initxv__(**kwargs)
             return
-        elif forward_type.startswith("zigma"):
+        elif forward_type.startswith("zigzagN"):
             self.__init_zigma__(**kwargs)
         else:
             self.__initv2__(**kwargs)
@@ -636,7 +646,7 @@ class SS2D(nn.Module, mamba_init):
                 **factory_kwargs,
             )
 
-        if forward_type.startswith("zigma"):
+        if forward_type.startswith("zigzagN"):
             k_group = 1  # Important
             # x proj ============================
             self.x_proj = [
@@ -1197,31 +1207,15 @@ class SS2D(nn.Module, mamba_init):
 
         # softmax | sigmoid | dwconv | norm ===========================
         self.out_norm_shape = "v1"
-        if forward_type[-len("none") :] == "none":
-            forward_type = forward_type[: -len("none")]
-            self.out_norm = nn.Identity()
-        elif forward_type[-len("dwconv3") :] == "dwconv3":
-            forward_type = forward_type[: -len("dwconv3")]
-            self.out_norm = nn.Conv2d(
-                d_inner, d_inner, kernel_size=3, padding=1, groups=d_inner, bias=False
-            )
-        elif forward_type[-len("softmax") :] == "softmax":
-            forward_type = forward_type[: -len("softmax")]
+        self.out_norm = nn.Identity()
 
-            class SoftmaxSpatial(nn.Softmax):
-                def forward(self, x: torch.Tensor):
-                    B, C, H, W = x.shape
-                    return super().forward(x.view(B, C, -1)).view(B, C, H, W)
-
-            self.out_norm = SoftmaxSpatial(dim=-1)
-        elif forward_type[-len("sigmoid") :] == "sigmoid":
-            forward_type = forward_type[: -len("sigmoid")]
-            self.out_norm = nn.Sigmoid()
-        elif channel_first:
-            self.out_norm = LayerNorm2d(d_inner)
-        else:
-            self.out_norm_shape = "v0"
-            self.out_norm = nn.LayerNorm(d_inner)
+        ####zigzag_paths = kwargs.get("zigzag_paths", None)
+        self.zigzag_paths = kwargs.get("zigzag_paths", None)
+        self.zigzag_paths_reverse = kwargs.get("zigzag_paths_reverse", None)
+        self.video_frames = kwargs.get("video_frames", None)
+        self.st_order = kwargs.get("st_order", None)
+        self.extras = kwargs.get("extras", None)
+        self.layer_idx = kwargs.get("layer_idx", None)
 
         self.forward_core = partial(
             self.forward_corev2_zigma,
@@ -1247,11 +1241,13 @@ class SS2D(nn.Module, mamba_init):
             )
 
         # x proj ============================
-        self.x_proj = nn.Linear(
-            d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs
-        )
-
-        self.x_proj_weight = nn.Parameter(self.x_proj.weight)  # (N, inner)
+        self.x_proj = [
+            nn.Linear(d_inner, (dt_rank + d_state * 2), bias=False, **factory_kwargs)
+            for _ in range(k_group)
+        ]
+        self.x_proj_weight = nn.Parameter(
+            torch.stack([t.weight for t in self.x_proj], dim=0)
+        )  # (K, N, inner)
         del self.x_proj
 
         # out proj =======================================
@@ -1261,18 +1257,25 @@ class SS2D(nn.Module, mamba_init):
 
         if initialize in ["v0"]:
             # dt proj ============================
-            self.dt_projs = self.dt_init(
-                dt_rank,
-                d_inner,
-                dt_scale,
-                dt_init,
-                dt_min,
-                dt_max,
-                dt_init_floor,
-                **factory_kwargs,
-            )
-            self.dt_projs_weight = nn.Parameter(self.dt_projs.weight)  # (inner, rank)
-            self.dt_projs_bias = nn.Parameter(self.dt_projs.bias)  # (inner, rank)
+            self.dt_projs = [
+                self.dt_init(
+                    dt_rank,
+                    d_inner,
+                    dt_scale,
+                    dt_init,
+                    dt_min,
+                    dt_max,
+                    dt_init_floor,
+                    **factory_kwargs,
+                )
+                for _ in range(k_group)
+            ]
+            self.dt_projs_weight = nn.Parameter(
+                torch.stack([t.weight for t in self.dt_projs], dim=0)
+            )  # (K, inner, rank)
+            self.dt_projs_bias = nn.Parameter(
+                torch.stack([t.bias for t in self.dt_projs], dim=0)
+            )  # (K, inner)
             del self.dt_projs
 
             # A, D =======================================
@@ -1509,144 +1512,6 @@ class SS2D(nn.Module, mamba_init):
 
         return y.to(x.dtype) if to_dtype else y
 
-    # copied from function forward_corev2()
-    def forward_corev2_zigma_old(
-        self,
-        x: torch.Tensor = None,
-        x_proj_weight: torch.Tensor = None,
-        x_proj_bias: torch.Tensor = None,
-        dt_projs_weight: torch.Tensor = None,
-        dt_projs_bias: torch.Tensor = None,
-        A_logs: torch.Tensor = None,
-        Ds: torch.Tensor = None,
-        delta_softplus=True,
-        out_norm: torch.nn.Module = None,
-        out_norm_shape="v0",
-        channel_first=False,
-        # ==============================
-        to_dtype=True,  # True: final out to dtype
-        force_fp32=False,  # True: input fp32
-        # ==============================
-        nrows=-1,  # for SelectiveScanNRow; 0: auto; -1: disable;
-        backnrows=-1,  # for SelectiveScanNRow; 0: auto; -1: disable;
-        ssoflex=True,  # True: out fp32 in SSOflex; else, SSOflex is the same as SSCore
-        # ==============================
-        SelectiveScan=None,
-        no_einsum=False,  # replace einsum with linear or conv1d to raise throughput
-        **kwargs,
-    ):
-        x_proj_weight = self.x_proj_weight
-        dt_projs_weight = self.dt_projs_weight
-        dt_projs_bias = self.dt_projs_bias
-        A_logs = self.A_logs
-        Ds = self.Ds
-        out_norm = getattr(self, "out_norm", None)
-        out_norm_shape = getattr(self, "out_norm_shape", "v0")
-        channel_first = self.channel_first
-        to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
-
-        # out_norm: whatever fits (B, L, C); LayerNorm; Sigmoid; Softmax(dim=1);...
-
-        B, D, H, W = x.shape
-        D, N = A_logs.shape
-        D, R = dt_projs_weight.shape
-        L = H * W
-
-        def selective_scan(
-            u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=True
-        ):
-
-            res = SelectiveScanCore.apply(
-                u,
-                delta,
-                A,
-                B,
-                C,
-                D,
-                delta_bias,
-                delta_softplus,
-                nrows,
-                backnrows,
-                ssoflex,
-            )
-            return res
-
-        xs = rearrange(x, "b c w h -> b c (w h)")  # xs = CrossScan.apply(x)
-        if no_einsum:
-            raise NotImplementedError("not checked by me yet")
-            x_dbl = F.conv1d(
-                xs.view(B, -1, L),
-                x_proj_weight.view(-1, D, 1),
-                bias=(x_proj_bias.view(-1) if x_proj_bias is not None else None),
-                groups=K,
-            )
-            dts, Bs, Cs = torch.split(x_dbl.view(B, K, -1, L), [R, N, N], dim=2)
-            dts = F.conv1d(
-                dts.contiguous().view(B, -1, L),
-                dt_projs_weight.view(K * D, -1, 1),
-                groups=K,
-            )
-        else:
-            x_dbl = torch.einsum("b  d l,  c d -> b  c l", xs, x_proj_weight)
-            if x_proj_bias is not None:
-                x_dbl = x_dbl + x_proj_bias.view(1, K, -1, 1)
-            dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=1)
-            dts = torch.einsum("b  r l,  d r -> b  d l", dts, dt_projs_weight)
-
-        xs = xs.view(B, -1, L)  # directly combine them together [B,C,H*W]->[B,C,H*W]
-        dts = dts.contiguous().view(B, -1, L)
-        As = -torch.exp(A_logs.to(torch.float))  # (k * c, d_state)
-        Bs = Bs.contiguous().view(B, N, L)
-        Cs = Cs.contiguous().view(B, N, L)
-        Ds = Ds.to(torch.float)  # (K * c)
-        delta_bias = dt_projs_bias.view(-1).to(torch.float)
-
-        if force_fp32:
-            xs, dts, Bs, Cs = to_fp32(xs, dts, Bs, Cs)
-
-        ys: torch.Tensor = selective_scan(
-            xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
-        ).view(B, -1, H, W)
-
-        y = ys  # y: torch.Tensor = CrossMerge.apply(ys)
-
-        if getattr(self, "__DEBUG__", False):
-            setattr(
-                self,
-                "__data__",
-                dict(
-                    A_logs=A_logs,
-                    Bs=Bs,
-                    Cs=Cs,
-                    Ds=Ds,
-                    us=xs,
-                    dts=dts,
-                    delta_bias=delta_bias,
-                    ys=ys,
-                    y=y,
-                ),
-            )
-
-        if channel_first:
-            y = y.view(B, -1, H, W)
-            if out_norm_shape in ["v1"]:
-                y = out_norm(y)
-            else:
-                y = out_norm(y.permute(0, 2, 3, 1))
-                y = y.permute(0, 3, 1, 2)
-            return y.to(x.dtype) if to_dtype else y
-
-        if out_norm_shape in ["v1"]:  # (B, C, H, W)
-            y = out_norm(y.view(B, -1, H, W)).permute(0, 2, 3, 1)  # (B, H, W, C)
-        else:  # (B, L, C)
-            y = y.transpose(dim0=1, dim1=2).contiguous()  # (B, L, C)
-            y = out_norm(y).view(B, H, W, -1)
-
-        return y.to(x.dtype) if to_dtype else y
-
-
-    # Note: we did not use csm_triton in and before vssm1_0230, we used pytorch version !
-    # Note: we did not use no_einsum in and before vssm1_0230, we used einsum version !
     def forward_corev2_zigma(
         self,
         x: torch.Tensor = None,
@@ -1658,7 +1523,7 @@ class SS2D(nn.Module, mamba_init):
         Ds: torch.Tensor = None,
         delta_softplus=True,
         out_norm: torch.nn.Module = None,
-        out_norm_shape="v0",
+        out_norm_shape="v1",
         channel_first=False,
         # ==============================
         to_dtype=True,  # True: final out to dtype
@@ -1669,8 +1534,6 @@ class SS2D(nn.Module, mamba_init):
         ssoflex=True,  # True: out fp32 in SSOflex; else, SSOflex is the same as SSCore
         # ==============================
         SelectiveScan=None,
-        CrossScan=CrossScan,
-        CrossMerge=CrossMerge,
         no_einsum=False,  # replace einsum with linear or conv1d to raise throughput
         **kwargs,
     ):
@@ -1680,7 +1543,7 @@ class SS2D(nn.Module, mamba_init):
         A_logs = self.A_logs
         Ds = self.Ds
         out_norm = getattr(self, "out_norm", None)
-        out_norm_shape = getattr(self, "out_norm_shape", "v0")
+        out_norm_shape = getattr(self, "out_norm_shape", "v1")
         channel_first = self.channel_first
         to_fp32 = lambda *args: (_a.to(torch.float32) for _a in args)
 
@@ -1690,6 +1553,8 @@ class SS2D(nn.Module, mamba_init):
         D, N = A_logs.shape
         K, D, R = dt_projs_weight.shape
         L = H * W
+
+        assert nrows == -1 and backnrows == -1, "not implemented yet"
 
         if nrows == 0:
             if D % 4 == 0:
@@ -1728,7 +1593,15 @@ class SS2D(nn.Module, mamba_init):
                 ssoflex,
             )
 
-        xs = CrossScan.apply(x)
+        #### TODO, add zigma_related
+        #### rearrange
+        assert self.extras == 0
+        _perm = self.zigzag_paths[self.layer_idx]
+        _perm_rev = self.zigzag_paths_reverse[self.layer_idx]
+        x = x.view(B, -1, H * W)
+        xs = x[:, :, _perm].contiguous()  # [B,C,T]
+        #### rearrange done
+        xs = rearrange(xs, "b c l -> b 1 c l")  # CrossScan.apply(x)
         if no_einsum:
             x_dbl = F.conv1d(
                 xs.view(B, -1, L),
@@ -1764,7 +1637,12 @@ class SS2D(nn.Module, mamba_init):
             xs, dts, As, Bs, Cs, Ds, delta_bias, delta_softplus
         ).view(B, K, -1, H, W)
 
-        y: torch.Tensor = CrossMerge.apply(ys)
+        # y: torch.Tensor = CrossMerge.apply(ys)
+        #### rearrange back
+        y = ys.view(B, -1, H * W)
+        y = y[:, :, _perm_rev].contiguous()  # out is [B,T,C]
+        y = y.view(B, -1, H, W)
+        #### rearrange back done
 
         if getattr(self, "__DEBUG__", False):
             setattr(
@@ -1799,7 +1677,6 @@ class SS2D(nn.Module, mamba_init):
             y = out_norm(y).view(B, H, W, -1)
 
         return y.to(x.dtype) if to_dtype else y
-    
 
     # Note: we did not use csm_triton in and before vssm1_0230, we used pytorch version !
     # Note: we did not use no_einsum in and before vssm1_0230, we used einsum version !
@@ -2201,7 +2078,7 @@ class VSSBlock(nn.Module):
         # =============================
         use_checkpoint: bool = False,
         post_norm: bool = False,
-        **kwargs,
+        **block_kwargs,
     ):
         super().__init__()
         self.ssm_branch = ssm_ratio > 0
@@ -2233,6 +2110,7 @@ class VSSBlock(nn.Module):
                 # ==========================
                 forward_type=forward_type,
                 channel_first=channel_first,
+                **block_kwargs,
             )
 
         self.drop_path = DropPath(drop_path)
@@ -2272,6 +2150,7 @@ class VSSBlock(nn.Module):
 class VSSM(nn.Module):
     def __init__(
         self,
+        img_size=None,  #
         patch_size=4,
         in_chans=3,
         num_classes=1000,
@@ -2302,6 +2181,8 @@ class VSSM(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        if img_size is None:
+            assert img_size is not None, "Tao HU: img_size should be given"
         self.channel_first = norm_layer.lower() in ["bn", "ln2d"]
         self.num_classes = num_classes
         self.num_layers = len(depths)
@@ -2350,6 +2231,61 @@ class VSSM(nn.Module):
             none=(lambda *_, **_k: None),
         ).get(downsample_version, None)
 
+        self.extras = 0
+        block_kwargs = {}
+        print("forward_type", forward_type)
+        patch_side_len = [56, 28, 14, 7]
+        assert len(patch_side_len) == len(depths)
+        print("patch_side_len", patch_side_len)  #
+        if forward_type.startswith("zigzagN"):
+
+            def get_scan_path(patch_side_len):
+                if forward_type.startswith("zigzagN"):
+                    _zz_paths = zigzag_path(N=patch_side_len)
+                    if forward_type.startswith("zigzagN"):
+                        zigzag_num = int(forward_type.replace("zigzagN", ""))
+                        zz_paths = _zz_paths[:zigzag_num]
+                        assert (
+                            len(zz_paths) == zigzag_num
+                        ), f"{len(zz_paths)} != {zigzag_num}"
+                    else:
+                        raise ValueError("forward_type should be xx")
+                else:
+                    raise ValueError("forward_type doenst match")
+                print("zigzag_num", len(zz_paths))
+                #############
+                zz_paths_rev = [reverse_permut_np(_) for _ in zz_paths]
+                zz_paths = zz_paths * self.num_layers
+                zz_paths_rev = zz_paths_rev * self.num_layers
+                zz_paths = [torch.from_numpy(_).to("cuda") for _ in zz_paths]
+                zz_paths_rev = [torch.from_numpy(_).to("cuda") for _ in zz_paths_rev]
+                assert len(zz_paths) == len(
+                    zz_paths_rev
+                ), f"{len(zz_paths)} != {len(zz_paths_rev)}"
+
+            zz_paths, zz_paths_rev = [], []
+            for _blockid, _depth in enumerate(depths):
+                _zz_paths, _zz_paths_rev = get_scan_path(patch_side_len)
+                _zz_paths, _zz_paths_rev = _zz_paths[:_depth], _zz_paths_rev[:_depth]
+                zz_paths.extend(_zz_paths)
+                zz_paths_rev.extend(_zz_paths_rev)
+
+            for layer_idx, (_zz_path, _zz_rev) in enumerate(
+                zip(zz_paths, zz_paths_rev)
+            ):
+                print(
+                    f"layer_idx:{layer_idx}, len:{len(_zz_path)}, len_rev:{len(_zz_rev)}"
+                )
+
+            block_kwargs["zigzag_paths"] = zz_paths
+            block_kwargs["zigzag_paths_reverse"] = zz_paths_rev
+            block_kwargs["extras"] = self.extras
+            print("zigzag_paths length", len(zz_paths))
+
+        else:
+            raise ValueError("forward_type doesn't match")
+
+        self.global_layer_index = 0
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             downsample = (
@@ -2362,7 +2298,6 @@ class VSSM(nn.Module):
                 if (i_layer < self.num_layers - 1)
                 else nn.Identity()
             )
-
             self.layers.append(
                 self._make_layer(
                     dim=self.dims[i_layer],
@@ -2386,6 +2321,7 @@ class VSSM(nn.Module):
                     mlp_act_layer=mlp_act_layer,
                     mlp_drop_rate=mlp_drop_rate,
                     gmlp=gmlp,
+                    **block_kwargs,
                 )
             )
 
@@ -2512,8 +2448,9 @@ class VSSM(nn.Module):
             norm_layer(out_dim),
         )
 
-    @staticmethod
+    # @staticmethod
     def _make_layer(
+        self,
         dim=96,
         drop_path=[0.1, 0.1],
         use_checkpoint=False,
@@ -2535,12 +2472,13 @@ class VSSM(nn.Module):
         mlp_act_layer=nn.GELU,
         mlp_drop_rate=0.0,
         gmlp=False,
-        **kwargs,
+        **block_kwargs,
     ):
         # if channel first, then Norm and Output are both channel_first
         depth = len(drop_path)
         blocks = []
         for d in range(depth):
+            block_kwargs.update(layer_idx=self.global_layer_index)
             blocks.append(
                 VSSBlock(
                     hidden_dim=dim,
@@ -2561,8 +2499,10 @@ class VSSM(nn.Module):
                     mlp_drop_rate=mlp_drop_rate,
                     gmlp=gmlp,
                     use_checkpoint=use_checkpoint,
+                    **block_kwargs,
                 )
             )
+            self.global_layer_index += 1
 
         return nn.Sequential(
             OrderedDict(
@@ -2745,12 +2685,12 @@ if __name__ == "__main__":
     import torch
 
     if True:
-        _model = VSSM(forward_type="zigmaN8").to("cuda")
+        _model = VSSM(img_size=224, forward_type="zigzagN8").to("cuda")
         x = torch.randn((1, 3, 224, 224)).to("cuda")
         y = _model(x)
         print(y.shape)
     else:
-        _model = VSSM(forward_type="v3noz").to("cuda")
+        _model = VSSM(img_size=224, forward_type="v3noz").to("cuda")
         x = torch.randn((1, 3, 224, 224)).to("cuda")
         y = _model(x)
         print(y.shape)
